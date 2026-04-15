@@ -71,6 +71,22 @@ $uiDir = Join-Path $gammaPath "overwrite\gamedata\configs\ui"
 New-Item -ItemType Directory -Path $uiDir -Force | Out-Null
 Copy-Item (Join-Path $scriptDir "ui\ui_mp_menu.xml") (Join-Path $uiDir "ui_mp_menu.xml") -Force
 
+# --- Fix unjam mod keybind collision (R key opens MP menu without this) ---
+Write-Host "Patching unjam mod keybind..."
+$unjamScript = Join-Path $gammaPath "mods\G.A.M.M.A. Unjam Reload on the same key\gamedata\scripts\arti_jamming.script"
+if (Test-Path $unjamScript) {
+    $content = Get-Content $unjamScript -Raw
+    if ($content -match 'bind wpn_reload kF10') {
+        $content = $content -replace 'bind wpn_reload kF10', 'bind wpn_reload kRSHIFT'
+        Set-Content $unjamScript $content -NoNewline
+        Write-Host "  Patched: wpn_reload moved from F10 to RSHIFT (F10 is MP menu)" -ForegroundColor Green
+    } else {
+        Write-Host "  Already patched or mod updated, skipping." -ForegroundColor Yellow
+    }
+} else {
+    Write-Host "  Unjam mod not found, skipping." -ForegroundColor Yellow
+}
+
 # --- Verify ---
 Write-Host ""
 Write-Host "=== Verification ===" -ForegroundColor Yellow
