@@ -1,0 +1,658 @@
+--- mp_client_state.script: Client-side state application
+--- Receives events and snapshots from host, applies them to the local world.
+--- The client's A-Life update loop is suppressed; all entity state comes from here.
+---
+--- CRITICAL: Entity ID Mapping
+--- The host sends its entity IDs. When the client calls alife():create(), the engine
+--- generates a NEW local ID. We maintain a bidirectional mapping:
+---   _host_to_local[host_id] -> local_id
+---   _local_to_host[local_id] -> host_id
+--- ALL lookups of entities received from the network go through resolve_id().
+---
+--- STATE MACHINE:
+---   IDLE → (on_full_state) → CLEANING → (all deleted) → SYNCING → (queue drained) → ACTIVE
+---
+---   CLEANING: Deleting pre-existing save entities in batches. Incoming ENTITY_SPAWN
+---             messages are queued. Position/death/despawn messages are dropped (stale entities).
+---   SYNCING:  Processing queued ENTITY_SPAWN messages in batches. Position updates
+---             applied to any entities that exist. Death/despawn applied normally.
+---   ACTIVE:   Normal operation. All messages applied immediately.
+
+-- Client sync states
+local STATE_IDLE     = 0
+local STATE_CLEANING = 1  -- deleting pre-existing entities
+local STATE_SYNCING  = 2  -- processing queued spawns
+local STATE_ACTIVE   = 3  -- normal operation
+
+local _sync_state = STATE_IDLE
+
+-- ID mapping tables
+local _host_to_local = {}   -- host_id -> local_id
+local _local_to_host = {}   -- local_id -> host_id
+
+-- Track entities we've created from network data
+local _network_entities = {}  -- host_id -> { section, last_pos, ... }
+local _remote_players = {}    -- conn_id -> { id, pos, ... }
+
+-- Pending spawns waiting for server_entity_on_register callback
+-- Key: "section_x_y_z" (full float precision) -> FIFO list of host_ids
+-- List-based to handle same-section entities at identical positions (stacked loot, etc.)
+local _pending_spawns = {}    -- section_key -> { host_id, host_id, ... }
+
+-- Cleanup state
+local _cleanup_ids = {}       -- array of entity IDs to delete
+local _cleanup_index = 0      -- current position in _cleanup_ids
+local _cleanup_batch = 50     -- entities to release per frame
+
+-- Spawn queue (messages received during CLEANING phase)
+local _spawn_queue = {}       -- array of spawn data tables
+local _spawn_queue_index = 0  -- current position during SYNCING
+local _spawn_batch = 20       -- entities to create per frame (lower than cleanup — create is heavier)
+
+-- Pending position updates for entities whose spawn message hasn't been processed yet.
+-- UDP position snapshots can arrive before the TCP spawn event (Bug #13).
+-- Queued here, then flushed when the ID mapping is established in on_local_entity_registered.
+local _pending_positions = {} -- host_id -> { x, y, z, h }
+
+-- Guard flag: true while on_entity_death() is executing kill_entity().
+-- Prevents npc_on_death_callback from echoing back through host event handlers
+-- if they were ever accidentally registered on a client (Bug #7 defense-in-depth).
+local _applying_remote_death = false
+
+-- ============================================================================
+-- ID Mapping
+-- ============================================================================
+
+--- Translate a host entity ID to the local client ID.
+--- Returns nil if no mapping exists (entity not yet created locally).
+function resolve_id(host_id)
+    if not host_id then return nil end
+    return _host_to_local[host_id] or nil
+end
+
+--- Register a mapping between host and local IDs.
+function map_id(host_id, local_id)
+    _host_to_local[host_id] = local_id
+    _local_to_host[local_id] = host_id
+end
+
+--- Remove a mapping (entity destroyed).
+function unmap_id(host_id)
+    local local_id = _host_to_local[host_id]
+    if local_id then
+        _local_to_host[local_id] = nil
+    end
+    _host_to_local[host_id] = nil
+end
+
+--- Get the host ID for a local entity (reverse lookup).
+function reverse_id(local_id)
+    if not local_id then return nil end
+    return _local_to_host[local_id] or nil
+end
+
+-- ============================================================================
+-- Spawn Interception
+-- ============================================================================
+
+--- Called from a server_entity_on_register callback hook.
+--- When we call alife():create(), the engine fires server_entity_on_register
+--- with the NEW local se_obj. We intercept this to capture the local ID
+--- and complete the ID mapping.
+function on_local_entity_registered(se_obj)
+    if not se_obj then return end
+
+    local section = se_obj:section_name()
+    local pos = se_obj.position
+
+    -- Build the same key we stored in _pending_spawns (full float precision)
+    local key = string.format("%s_%.4f_%.4f_%.4f",
+        section, pos.x, pos.y, pos.z)
+
+    local list = _pending_spawns[key]
+    if list and #list > 0 then
+        -- FIFO: pop the first host_id that was queued for this key
+        local host_id = table.remove(list, 1)
+        if #list == 0 then
+            _pending_spawns[key] = nil
+        end
+        map_id(host_id, se_obj.id)
+        printf("[GAMMA MP] ID mapped: host %d -> local %d (%s)", host_id, se_obj.id, section)
+
+        -- Flush any position update that arrived via UDP before this spawn (Bug #13)
+        local pending_pos = _pending_positions[host_id]
+        if pending_pos then
+            apply_entity_position(host_id, pending_pos.x, pending_pos.y, pending_pos.z, pending_pos.h)
+            _pending_positions[host_id] = nil
+        end
+    end
+end
+
+-- ============================================================================
+-- Entity Spawn (from host)
+-- ============================================================================
+
+--- Public entry point. Routes to queue or immediate execution based on state.
+function on_entity_spawn(data)
+    if not data.id or not data.section then return end
+
+    if _sync_state == STATE_CLEANING or _sync_state == STATE_IDLE then
+        -- Queue for later — we're still deleting pre-existing entities
+        _spawn_queue[#_spawn_queue + 1] = data
+        return
+    end
+
+    -- SYNCING or ACTIVE: execute immediately
+    do_entity_spawn(data)
+end
+
+--- Actual spawn logic. Called directly in ACTIVE state, or from tick_sync().
+function do_entity_spawn(data)
+    local host_id = data.id
+    local sim = alife()
+    if not sim then return end
+
+    -- Check if we already have a mapping for this host entity
+    local local_id = resolve_id(host_id)
+    if local_id then
+        local existing = sim:object(local_id)
+        if existing then
+            -- Entity exists locally, just update tracking
+            _network_entities[host_id] = data
+            return
+        else
+            -- Mapping is stale, clean it up
+            unmap_id(host_id)
+        end
+    end
+
+    -- Create the entity
+    local pos = vector():set(
+        data.pos_x or 0,
+        data.pos_y or 0,
+        data.pos_z or 0
+    )
+
+    -- Store a pending spawn key so on_local_entity_registered can map the ID.
+    -- Full float precision — engine preserves position exactly (float32).
+    -- List-based FIFO per key to handle same-section entities at identical coords.
+    local key = string.format("%s_%.4f_%.4f_%.4f",
+        data.section, pos.x, pos.y, pos.z)
+    _pending_spawns[key] = _pending_spawns[key] or {}
+    _pending_spawns[key][#_pending_spawns[key] + 1] = host_id
+
+    local parent_id = data.parent_id
+    if parent_id then
+        -- parent_id is also a host ID — resolve it
+        local local_parent = resolve_id(parent_id)
+        if local_parent then
+            mp_alife_guard.internal_create(sim, data.section, pos,
+                data.lvid or 0,
+                data.gvid or 0,
+                local_parent)
+        else
+            -- Parent not yet created; spawn in world, will get picked up later
+            printf("[GAMMA MP] WARNING: Parent %d not mapped, spawning in world", parent_id)
+            mp_alife_guard.internal_create(sim, data.section, pos,
+                data.lvid or 0,
+                data.gvid or 0)
+        end
+    else
+        -- World entity
+        mp_alife_guard.internal_create(sim, data.section, pos,
+            data.lvid or 0,
+            data.gvid or 0)
+    end
+
+    _network_entities[host_id] = data
+end
+
+-- ============================================================================
+-- Entity Death (from host)
+-- ============================================================================
+
+function on_entity_death(data)
+    if not data.id then return end
+    -- Drop during CLEANING — these entities are being wiped anyway
+    if _sync_state == STATE_CLEANING then return end
+
+    local host_id = data.id
+    local local_id = resolve_id(host_id)
+    if not local_id then
+        printf("[GAMMA MP] WARNING: Death for unmapped host entity %d", host_id)
+        return
+    end
+
+    local sim = alife()
+    if not sim then return end
+
+    local se_obj = sim:object(local_id)
+    if not se_obj then
+        unmap_id(host_id)
+        _network_entities[host_id] = nil
+        return
+    end
+
+    -- Resolve killer se_obj once (if applicable)
+    local killer_se = nil
+    if data.killer_id and data.killer_id >= 0 then
+        local killer_local = resolve_id(data.killer_id)
+        if killer_local then
+            killer_se = sim:object(killer_local)
+        end
+    end
+
+    -- Set guard before kill_entity so that any npc_on_death_callback fired
+    -- synchronously by the engine cannot echo back as a broadcast (Bug #7).
+    _applying_remote_death = true
+    if killer_se then
+        sim:kill_entity(se_obj, killer_se)
+    else
+        sim:kill_entity(se_obj)
+    end
+    _applying_remote_death = false
+
+    -- Don't unmap yet — the entity might still exist as a corpse.
+    -- Unmap when we get ENTITY_DESPAWN.
+    _network_entities[host_id] = nil
+end
+
+-- ============================================================================
+-- Entity Despawn (from host)
+-- ============================================================================
+
+function on_entity_despawn(data)
+    if not data.id then return end
+    -- Drop during CLEANING — these entities are being wiped anyway
+    if _sync_state == STATE_CLEANING then return end
+
+    local host_id = data.id
+    local local_id = resolve_id(host_id)
+
+    if local_id then
+        local sim = alife()
+        if sim then
+            local se_obj = sim:object(local_id)
+            if se_obj then
+                mp_alife_guard.internal_release(sim, se_obj, true)
+            end
+        end
+        unmap_id(host_id)
+    end
+
+    _network_entities[host_id] = nil
+end
+
+-- ============================================================================
+-- Entity Position Updates (from host, unreliable channel)
+-- ============================================================================
+
+function on_entity_positions(entities)
+    if not entities then return end
+
+    -- Drop position updates during CLEANING — entities are being deleted
+    if _sync_state == STATE_CLEANING then return end
+
+    for _, e in ipairs(entities) do
+        local local_id = resolve_id(e.id)
+        if local_id then
+            -- Entity mapped, apply immediately
+            apply_entity_position(e.id, e.x, e.y, e.z, e.h)
+        else
+            -- Entity not yet mapped — UDP position arrived before TCP spawn.
+            -- Queue for flush when on_local_entity_registered completes the mapping.
+            _pending_positions[e.id] = { x = e.x, y = e.y, z = e.z, h = e.h }
+        end
+    end
+end
+
+function apply_entity_position(host_id, x, y, z, health)
+    if not host_id then return end
+
+    local local_id = resolve_id(host_id)
+    if not local_id then return end  -- unknown entity, skip silently (unreliable channel)
+
+    -- Try game_object first (online entity on same level)
+    local obj = level.object_by_id(local_id)
+    if obj then
+        local target_pos = vector():set(x, y, z)
+        obj:force_set_position(target_pos)
+
+        -- Update health if significantly different
+        if health and obj:alive() then
+            local current_h = obj:health()
+            if math.abs(current_h - health) > 0.05 then
+                -- TODO: Phase 2 - smooth health transitions
+            end
+        end
+        return
+    end
+
+    -- Fallback: offline entity, use teleport_object.
+    -- Only teleport if entity is on the client's current level — calling
+    -- teleport_object with vertex IDs from another level corrupts the
+    -- entity's navigation state in the local A-Life sim.
+    local sim = alife()
+    if sim then
+        local se_obj = sim:object(local_id)
+        if se_obj then
+            local gvid = se_obj.m_game_vertex_id
+            local gg = game_graph()
+            if gg and gg:valid_vertex_id(gvid) and db.actor then
+                local actor_gvid = db.actor:game_vertex_id()
+                if gg:valid_vertex_id(actor_gvid) and
+                   gg:vertex(gvid):level_id() ~= gg:vertex(actor_gvid):level_id() then
+                    return
+                end
+            end
+            local pos = vector():set(x, y, z)
+            sim:teleport_object(local_id, gvid, se_obj.m_level_vertex_id, pos)
+        end
+    end
+end
+
+-- ============================================================================
+-- Squad Assignment (from host)
+-- ============================================================================
+
+function on_squad_assign(data)
+    if not data.squad_id or not data.smart_name then return end
+
+    local local_squad_id = resolve_id(data.squad_id)
+    if not local_squad_id then
+        printf("[GAMMA MP] WARNING: Squad assign for unmapped host entity %d", data.squad_id)
+        return
+    end
+
+    local sim = alife()
+    if not sim then return end
+
+    local squad = sim:object(local_squad_id)
+    if not squad then return end
+
+    if not SIMBOARD then return end
+
+    local smart = SIMBOARD:get_smart_by_name(data.smart_name)
+    if smart then
+        SIMBOARD:assign_squad_to_smart(squad, smart)
+    end
+end
+
+-- ============================================================================
+-- Weather Sync (from host)
+-- ============================================================================
+
+function on_weather_sync(data)
+    if not data.preset then return end
+    level.set_weather(data.preset, true)
+end
+
+-- ============================================================================
+-- Time Sync (from host)
+-- ============================================================================
+
+function on_time_sync(data)
+    if not data.hours or not data.mins then return end
+
+    if data.factor then
+        level.set_time_factor(data.factor)
+    end
+
+    if level.set_game_time then
+        level.set_game_time(data.hours, data.mins, data.secs or 0)
+    else
+        local cur_h = level.get_time_hours()
+        local cur_m = level.get_time_minutes()
+        local delta_h = data.hours - cur_h
+        local delta_m = data.mins - cur_m
+
+        -- Wraparound for backward time: change_game_time only goes forward,
+        -- so add 24h when the target is behind current time
+        if delta_h < 0 or (delta_h == 0 and delta_m < 0) then
+            delta_h = delta_h + 24
+        end
+
+        if delta_h ~= 0 or delta_m ~= 0 then
+            level.change_game_time(0, delta_h, delta_m)
+        end
+    end
+end
+
+-- ============================================================================
+-- Full State (initial sync for new client)
+-- ============================================================================
+
+function on_full_state(data)
+    printf("[GAMMA MP] Receiving full world state from host...")
+
+    -- Clear any stale mappings from a previous session
+    _host_to_local = {}
+    _local_to_host = {}
+    _network_entities = {}
+    _pending_spawns = {}
+    _pending_positions = {}
+    _spawn_queue = {}
+    _spawn_queue_index = 0
+
+    if data.entity_count then
+        printf("[GAMMA MP] Expecting %d entities", data.entity_count)
+    end
+
+    -- Build list of all existing entities to delete (except the player).
+    -- This prevents double world state: save entities + host entities.
+    local sim = alife()
+    if not sim then
+        _sync_state = STATE_ACTIVE
+        return
+    end
+
+    local actor_id = db.actor and db.actor:id() or -1
+    _cleanup_ids = {}
+    _cleanup_index = 1
+
+    -- Single linear scan to collect IDs. After this, batched deletion.
+    for id = 0, 65534 do
+        if id ~= actor_id then
+            local se_obj = sim:object(id)
+            if se_obj then
+                _cleanup_ids[#_cleanup_ids + 1] = id
+            end
+        end
+    end
+
+    local count = #_cleanup_ids
+    printf("[GAMMA MP] Cleanup: %d pre-existing entities to remove (player excluded)", count)
+
+    if count == 0 then
+        -- Nothing to clean, go straight to syncing
+        _sync_state = STATE_SYNCING
+        printf("[GAMMA MP] No cleanup needed, entering SYNCING state")
+    else
+        _sync_state = STATE_CLEANING
+        printf("[GAMMA MP] Entering CLEANING state (%d entities, ~%d frames)",
+            count, math.ceil(count / _cleanup_batch))
+    end
+end
+
+-- ============================================================================
+-- Level Change (host changed level)
+-- Clears all state and resets to IDLE so we can accept a new FULL_STATE.
+-- The host sends LEVEL_CHANGE before FULL_STATE, so this always arrives first
+-- on the reliable channel.
+-- ============================================================================
+
+function on_level_change(data)
+    printf("[GAMMA MP] Host changed level to '%s' — clearing all client state",
+        data.level or "?")
+
+    -- Wipe all entity state — the host world has changed completely
+    _host_to_local = {}
+    _local_to_host = {}
+    _network_entities = {}
+    _pending_spawns = {}
+    _pending_positions = {}
+
+    -- Abandon any in-progress sync cycle
+    _spawn_queue = {}
+    _spawn_queue_index = 0
+    _cleanup_ids = {}
+    _cleanup_index = 0
+
+    -- Back to IDLE — the incoming FULL_STATE will kick off CLEANING → SYNCING → ACTIVE
+    _sync_state = STATE_IDLE
+
+    if db.actor then
+        news_manager.send_tip(db.actor,
+            "Host changed level — resyncing world...",
+            nil, nil, 5000)
+    end
+end
+
+-- ============================================================================
+-- Sync State Machine (called from mp_core.mp_update via client_tick)
+-- ============================================================================
+
+--- Called every frame by mp_core while client is active.
+--- Drives the CLEANING → SYNCING → ACTIVE state transitions.
+function client_tick()
+    if _sync_state == STATE_CLEANING then
+        tick_cleanup()
+    elseif _sync_state == STATE_SYNCING then
+        tick_sync()
+    end
+    -- STATE_ACTIVE and STATE_IDLE: nothing to tick
+end
+
+function tick_cleanup()
+    local sim = alife()
+    if not sim then
+        _sync_state = STATE_ACTIVE
+        return
+    end
+
+    local released = 0
+    while _cleanup_index <= #_cleanup_ids and released < _cleanup_batch do
+        local id = _cleanup_ids[_cleanup_index]
+        _cleanup_index = _cleanup_index + 1
+
+        local se_obj = sim:object(id)
+        if se_obj then
+            mp_alife_guard.internal_release(sim, se_obj, true)
+            released = released + 1
+        end
+    end
+
+    if _cleanup_index > #_cleanup_ids then
+        -- Cleanup done
+        _cleanup_ids = {}
+        _cleanup_index = 0
+        _spawn_queue_index = 1
+        _sync_state = STATE_SYNCING
+        printf("[GAMMA MP] Cleanup complete. Entering SYNCING state (%d queued spawns)",
+            #_spawn_queue)
+    end
+end
+
+function tick_sync()
+    local processed = 0
+    while _spawn_queue_index <= #_spawn_queue and processed < _spawn_batch do
+        local data = _spawn_queue[_spawn_queue_index]
+        _spawn_queue_index = _spawn_queue_index + 1
+
+        do_entity_spawn(data)
+        processed = processed + 1
+    end
+
+    if _spawn_queue_index > #_spawn_queue then
+        -- All queued spawns processed
+        _spawn_queue = {}
+        _spawn_queue_index = 0
+        _sync_state = STATE_ACTIVE
+        printf("[GAMMA MP] Sync complete. Entering ACTIVE state (%d entities, %d mappings)",
+            get_entity_count(), get_id_map_count())
+
+        if db.actor then
+            news_manager.send_tip(db.actor,
+                "World sync complete — " .. get_entity_count() .. " entities",
+                nil, nil, 5000)
+        end
+    end
+end
+
+function get_sync_state()
+    return _sync_state
+end
+
+function get_sync_state_name()
+    if _sync_state == STATE_IDLE then return "idle"
+    elseif _sync_state == STATE_CLEANING then return "cleaning"
+    elseif _sync_state == STATE_SYNCING then return "syncing"
+    elseif _sync_state == STATE_ACTIVE then return "active"
+    else return "unknown"
+    end
+end
+
+-- ============================================================================
+-- Remote Player Position (from host, forwarded from other clients)
+-- ============================================================================
+
+function on_remote_player_pos(data, conn_id)
+    if not data.entities or #data.entities == 0 then return end
+
+    for _, e in ipairs(data.entities) do
+        _remote_players[conn_id] = _remote_players[conn_id] or {}
+        _remote_players[conn_id].pos = vector():set(e.x, e.y, e.z)
+        _remote_players[conn_id].health = e.h
+        -- TODO: Phase 2 - render remote player as visible actor
+    end
+end
+
+-- ============================================================================
+-- Remote Player Equipment (from host)
+-- ============================================================================
+
+function on_remote_player_equip(data, conn_id)
+    _remote_players[conn_id] = _remote_players[conn_id] or {}
+    _remote_players[conn_id].equipment = data
+    -- TODO: Phase 2 - update remote player visual model
+end
+
+-- ============================================================================
+-- Utility
+-- ============================================================================
+
+function get_network_entities()
+    return _network_entities
+end
+
+function get_remote_players()
+    return _remote_players
+end
+
+function get_entity_count()
+    local count = 0
+    for _ in pairs(_network_entities) do count = count + 1 end
+    return count
+end
+
+function get_id_map_count()
+    local count = 0
+    for _ in pairs(_host_to_local) do count = count + 1 end
+    return count
+end
+
+--- Returns true while on_entity_death() is executing kill_entity().
+--- Used by mp_host_events to detect and suppress echo-back (Bug #7).
+function is_applying_remote_death()
+    return _applying_remote_death
+end
+
+--- Debug: dump the ID mapping table
+function dump_id_map()
+    printf("[GAMMA MP] === ID Mapping Table (%d entries) ===", get_id_map_count())
+    for host_id, local_id in pairs(_host_to_local) do
+        local info = _network_entities[host_id]
+        local section = info and info.section or "?"
+        printf("  host %d -> local %d (%s)", host_id, local_id, section)
+    end
+end

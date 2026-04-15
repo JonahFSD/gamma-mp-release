@@ -1,0 +1,566 @@
+--- mp_host_events.script: Host-side event capture and snapshot broadcasting
+--- Hooks AlifePlus xbus events and Demonized callbacks to capture A-Life state.
+--- Sends events and periodic snapshots to connected clients.
+---
+--- IMPORTANT: All entity IDs sent to clients are the HOST's native IDs.
+--- Clients maintain their own mapping table (host_id -> local_id).
+
+local MSG = nil  -- Lazy init from mp_protocol
+
+local _callbacks_registered = false
+
+-- Connected client tracking (conn_id -> player data)
+local _clients = {}
+
+-- Tracked entity registry — populated by server_entity_on_register callback.
+-- This replaces the 0-65534 linear scan. O(n) on actual entities, not 65K.
+local _tracked_entities = {}  -- id -> true
+local _tracked_count = 0
+
+-- Round-robin snapshot state (Bug #9 fix)
+-- _tracked_ids is a flat array mirroring _tracked_entities for indexed access.
+-- _snapshot_cursor is the start index for the next send_snapshots() call.
+local _tracked_ids = {}       -- integer-indexed array of entity IDs
+local _tracked_id_index = {}  -- id -> position in _tracked_ids (for O(1) removal)
+local _snapshot_cursor = 1
+
+-- Environment sync timer
+local _last_env_sync = nil
+
+-- Full state streaming state — per-connection cursor for multi-frame entity send.
+-- conn_id -> { ids = {entity id array snapshot}, cursor = int }
+local _full_state_pending = {}
+local _full_state_batch = 50  -- ENTITY_SPAWN messages per frame per connection
+
+-- Connected client set — populated in send_full_state(), cleared in cancel_full_state().
+-- Used by on_host_level_load() to know who needs a new FULL_STATE after a level change.
+-- Distinct from _full_state_pending (which is only set while a stream is in progress).
+local _connected_clients = {}
+
+-- Level name at last on_game_load. nil = first load (no transition yet).
+local _last_level_name = nil
+
+-- ============================================================================
+-- Lazy init
+-- ============================================================================
+
+local function ensure_msg()
+    if not MSG then
+        MSG = mp_protocol.get_msg_types()
+    end
+end
+
+-- ============================================================================
+-- Entity Tracking (replaces linear scan)
+-- ============================================================================
+
+local function track_entity(id)
+    if not _tracked_entities[id] then
+        _tracked_entities[id] = true
+        _tracked_count = _tracked_count + 1
+        -- Append to indexed array
+        local n = #_tracked_ids + 1
+        _tracked_ids[n] = id
+        _tracked_id_index[id] = n
+    end
+end
+
+local function untrack_entity(id)
+    if _tracked_entities[id] then
+        _tracked_entities[id] = nil
+        _tracked_count = _tracked_count - 1
+        -- Swap-remove from indexed array (O(1))
+        local pos = _tracked_id_index[id]
+        if pos then
+            local last = #_tracked_ids
+            if pos ~= last then
+                local swap_id = _tracked_ids[last]
+                _tracked_ids[pos] = swap_id
+                _tracked_id_index[swap_id] = pos
+            end
+            _tracked_ids[last] = nil
+            _tracked_id_index[id] = nil
+            -- Keep cursor valid after removal
+            if _snapshot_cursor > #_tracked_ids then
+                _snapshot_cursor = 1
+            end
+        end
+    end
+end
+
+-- ============================================================================
+-- Callback Registration
+-- ============================================================================
+
+function register_callbacks()
+    if _callbacks_registered then return end
+
+    -- Demonized engine callbacks (entity lifecycle)
+    RegisterScriptCallback("server_entity_on_register", on_entity_register)
+    RegisterScriptCallback("server_entity_on_unregister", on_entity_unregister)
+
+    -- Standard Anomaly callbacks
+    RegisterScriptCallback("npc_on_death_callback", on_npc_death)
+    RegisterScriptCallback("monster_on_death_callback", on_monster_death)
+    RegisterScriptCallback("on_game_load", on_host_level_load)
+
+    -- AlifePlus xbus integration (if available)
+    if xbus then
+        xbus.subscribe("cause:kill", on_alife_kill, "gamma_mp_host")
+        xbus.subscribe("cause:massacre", on_alife_massacre, "gamma_mp_host")
+        xbus.subscribe("cause:area", on_alife_area, "gamma_mp_host")
+        printf("[GAMMA MP] AlifePlus xbus hooks registered")
+    end
+
+    -- Build initial entity tracking from existing world state
+    build_entity_registry()
+
+    _callbacks_registered = true
+    printf("[GAMMA MP] Host callbacks registered")
+end
+
+function unregister_callbacks()
+    if not _callbacks_registered then return end
+
+    UnregisterScriptCallback("server_entity_on_register", on_entity_register)
+    UnregisterScriptCallback("server_entity_on_unregister", on_entity_unregister)
+    UnregisterScriptCallback("npc_on_death_callback", on_npc_death)
+    UnregisterScriptCallback("monster_on_death_callback", on_monster_death)
+    UnregisterScriptCallback("on_game_load", on_host_level_load)
+
+    if xbus then
+        xbus.unsubscribe("cause:kill", "gamma_mp_host")
+        xbus.unsubscribe("cause:massacre", "gamma_mp_host")
+        xbus.unsubscribe("cause:area", "gamma_mp_host")
+    end
+
+    _tracked_entities = {}
+    _tracked_count = 0
+    _tracked_ids = {}
+    _tracked_id_index = {}
+    _snapshot_cursor = 1
+    _connected_clients = {}
+    _full_state_pending = {}
+    _last_level_name = nil
+    _callbacks_registered = false
+    printf("[GAMMA MP] Host callbacks unregistered")
+end
+
+--- One-time scan to populate entity registry on host start.
+--- After this, register/unregister callbacks keep it current.
+function build_entity_registry()
+    local sim = alife()
+    if not sim then return end
+
+    _tracked_entities = {}
+    _tracked_count = 0
+    _tracked_ids = {}
+    _tracked_id_index = {}
+    _snapshot_cursor = 1
+
+    -- This is the one and only linear scan. After this, incremental updates only.
+    for id = 0, 65534 do
+        if sim:object(id) then
+            _tracked_entities[id] = true
+            _tracked_count = _tracked_count + 1
+            local n = #_tracked_ids + 1
+            _tracked_ids[n] = id
+            _tracked_id_index[id] = n
+        end
+    end
+
+    printf("[GAMMA MP] Entity registry built: %d entities tracked", _tracked_count)
+end
+
+-- ============================================================================
+-- Entity Lifecycle Events -> Network
+-- ============================================================================
+
+function on_entity_register(se_obj, source_tag)
+    ensure_msg()
+    if not se_obj then return end
+
+    -- ZCP/Warfare fire this callback from class overrides with a source_tag.
+    -- These are simulation infrastructure — track them but don't broadcast
+    -- spawn events for them (clients don't need squad/smart terrain objects).
+    if source_tag == "sim_squad_scripted"
+        or source_tag == "se_smart_terrain"
+        or source_tag == "sim_squad_warfare" then
+        track_entity(se_obj.id)
+        return
+    end
+
+    -- Track locally
+    track_entity(se_obj.id)
+
+    -- Don't broadcast if no clients connected
+    if gns.get_client_count() == 0 then return end
+
+    local data = {
+        id = se_obj.id,  -- host's native ID
+        section = se_obj:section_name(),
+        clsid = se_obj:clsid(),
+        pos_x = se_obj.position.x,
+        pos_y = se_obj.position.y,
+        pos_z = se_obj.position.z,
+        lvid = se_obj.m_level_vertex_id,
+        gvid = se_obj.m_game_vertex_id,
+    }
+
+    -- Include parent for inventory items
+    if se_obj.parent_id and se_obj.parent_id ~= 65535 then
+        data.parent_id = se_obj.parent_id  -- also host's native ID
+    end
+
+    mp_protocol.broadcast_event(MSG.ENTITY_SPAWN, data)
+end
+
+function on_entity_unregister(se_obj)
+    ensure_msg()
+    if not se_obj then return end
+
+    -- Untrack locally
+    untrack_entity(se_obj.id)
+
+    if gns.get_client_count() == 0 then return end
+
+    mp_protocol.broadcast_event(MSG.ENTITY_DESPAWN, {
+        id = se_obj.id,
+    })
+end
+
+-- ============================================================================
+-- Death Events -> Network (with full context for callback chain)
+-- ============================================================================
+
+function on_npc_death(npc, killer)
+    ensure_msg()
+    if not npc then return end
+    -- Defense-in-depth: if kill_entity() was called by the client to apply a
+    -- remote death event, the engine may fire npc_on_death_callback synchronously.
+    -- Host callbacks should never be registered on a client, but guard here
+    -- anyway to prevent an echo loop if they somehow are (Bug #7).
+    if mp_client_state.is_applying_remote_death() then return end
+    if gns.get_client_count() == 0 then return end
+
+    local data = {
+        id = npc:id(),
+        killer_id = killer and killer:id() or -1,
+    }
+
+    local pos = npc:position()
+    if pos then
+        data.pos_x = pos.x
+        data.pos_y = pos.y
+        data.pos_z = pos.z
+    end
+
+    mp_protocol.broadcast_event(MSG.ENTITY_DEATH, data)
+end
+
+function on_monster_death(monster, killer)
+    on_npc_death(monster, killer)
+end
+
+-- ============================================================================
+-- AlifePlus Event Forwarding
+-- ============================================================================
+
+function on_alife_kill(event_data)
+    -- Kill is already sent via on_npc_death. This captures A-Life consequences.
+end
+
+function on_alife_massacre(event_data)
+    -- Massacre threshold reached — squad reassignment follows via A-Life.
+end
+
+function on_alife_area(event_data)
+    -- Area conquest event — faction control changes.
+end
+
+-- ============================================================================
+-- Snapshot Broadcasting (called periodically from mp_core.mp_update)
+-- ============================================================================
+
+function send_snapshots()
+    ensure_msg()
+    if gns.get_client_count() == 0 then return end
+
+    local actor = db.actor
+    if not actor then return end
+
+    local sim = alife()
+    if not sim then return end
+
+    -- Collect online entity positions using round-robin over indexed array (Bug #9 fix)
+    local entities = {}
+    local count = 0
+    local total = #_tracked_ids
+
+    if total == 0 then
+        _snapshot_cursor = 1
+    else
+        -- Clamp cursor in case array shrunk
+        if _snapshot_cursor > total then
+            _snapshot_cursor = 1
+        end
+
+        local visited = 0
+        local idx = _snapshot_cursor
+
+        while count < 100 and visited < total do
+            local id = _tracked_ids[idx]
+            visited = visited + 1
+
+            local se_obj = sim:object(id)
+            if se_obj and se_obj:alive() then
+                local obj = level.object_by_id(id)
+                if obj then
+                    local pos = obj:position()
+                    if pos then
+                        count = count + 1
+                        entities[count] = {
+                            id = id,  -- host's native ID
+                            x = pos.x,
+                            y = pos.y,
+                            z = pos.z,
+                            h = obj:health() or 1.0,
+                        }
+                    end
+                end
+            end
+
+            idx = idx + 1
+            if idx > total then idx = 1 end
+        end
+
+        -- Advance cursor past what we visited for next frame
+        _snapshot_cursor = idx
+    end
+
+    if count > 0 then
+        mp_protocol.broadcast_snapshot(MSG.ENTITY_POS, entities)
+    end
+
+    -- Send host player position to all clients
+    if actor then
+        local pos = actor:position()
+        mp_protocol.broadcast_snapshot(MSG.PLAYER_POS, {
+            {
+                id = actor:id(),
+                x = pos.x,
+                y = pos.y,
+                z = pos.z,
+                h = actor:health(),
+            }
+        })
+    end
+
+    -- Periodic weather/time sync (every ~5 seconds)
+    local now = time_global()
+    if not _last_env_sync or now - _last_env_sync > 5000 then
+        _last_env_sync = now
+        send_environment_sync()
+    end
+end
+
+function send_environment_sync()
+    ensure_msg()
+
+    local weather = level.get_weather()
+    if weather then
+        mp_protocol.broadcast_event(MSG.WEATHER_SYNC, {
+            preset = weather,
+        })
+    end
+
+    mp_protocol.broadcast_event(MSG.TIME_SYNC, {
+        hours = level.get_time_hours(),
+        mins = level.get_time_minutes(),
+        factor = level.get_time_factor(),
+    })
+end
+
+-- ============================================================================
+-- Level Transition (host changed level)
+-- Registered as on_game_load — fires on every game load, including level
+-- transitions (which go through a save/load cycle in X-Ray).
+-- By the time this fires, server_entity_on_register has already updated
+-- _tracked_entities with the new level's entities.
+-- ============================================================================
+
+function on_host_level_load()
+    ensure_msg()
+
+    local current_level = level.name() or "unknown"
+
+    -- First call sets the baseline; don't broadcast on initial game load
+    -- (clients connect later, they get FULL_STATE normally on connect).
+    if _last_level_name == nil then
+        _last_level_name = current_level
+        return
+    end
+
+    -- Same level reload (e.g. load save on same map) — not a transition
+    if current_level == _last_level_name then return end
+
+    local prev_level = _last_level_name
+    _last_level_name = current_level
+
+    if gns.get_client_count() == 0 then return end
+
+    printf("[GAMMA MP] Host level transition: %s -> %s (%d clients)",
+        prev_level, current_level, gns.get_client_count())
+
+    -- Notify all clients to clear stale state.
+    -- Sent before FULL_STATE so clients process the reset first (reliable
+    -- channel guarantees ordering).
+    mp_protocol.broadcast_event(MSG.LEVEL_CHANGE, {
+        level = current_level,
+    })
+
+    -- Stream the new level's full entity state to every connected client.
+    -- send_full_state() snapshots _tracked_ids which is already current.
+    for conn_id in pairs(_connected_clients) do
+        send_full_state(conn_id)
+    end
+end
+
+-- ============================================================================
+-- Full State Dump (for new client connections)
+-- Streamed over multiple frames: _full_state_batch entities per frame.
+-- send_full_state() sends the header and queues the work.
+-- tick_full_state() is called every frame from mp_core.mp_update() to drive it.
+-- ============================================================================
+
+--- Drive one frame of full-state streaming for a single connection.
+local function _tick_full_state_connection(conn_id)
+    local state = _full_state_pending[conn_id]
+    if not state then return end
+
+    local sim = alife()
+    if not sim then
+        _full_state_pending[conn_id] = nil
+        return
+    end
+
+    local sent = 0
+    local ids = state.ids
+    local cursor = state.cursor
+
+    while cursor <= #ids and sent < _full_state_batch do
+        local id = ids[cursor]
+        cursor = cursor + 1
+
+        local se_obj = sim:object(id)
+        if se_obj then
+            local data = {
+                id = se_obj.id,  -- host's native ID
+                section = se_obj:section_name(),
+                clsid = se_obj:clsid(),
+                pos_x = se_obj.position.x,
+                pos_y = se_obj.position.y,
+                pos_z = se_obj.position.z,
+                lvid = se_obj.m_level_vertex_id,
+                gvid = se_obj.m_game_vertex_id,
+            }
+            if se_obj.parent_id and se_obj.parent_id ~= 65535 then
+                data.parent_id = se_obj.parent_id
+            end
+            mp_protocol.send_event(conn_id, MSG.ENTITY_SPAWN, data)
+            sent = sent + 1
+        end
+        -- se_obj nil: entity despawned since snapshot — skip silently
+    end
+
+    state.cursor = cursor
+
+    if cursor > #ids then
+        -- All entities streamed — append environment state and finish
+        mp_protocol.send_event(conn_id, MSG.WEATHER_SYNC, {
+            preset = level.get_weather() or "default",
+        })
+        mp_protocol.send_event(conn_id, MSG.TIME_SYNC, {
+            hours = level.get_time_hours(),
+            mins = level.get_time_minutes(),
+            factor = level.get_time_factor(),
+        })
+        _full_state_pending[conn_id] = nil
+        printf("[GAMMA MP] Full state stream complete to client %d", conn_id)
+    end
+end
+
+--- Begin streaming full world state to a newly connected client.
+--- Sends the FULL_STATE header immediately (so client enters CLEANING state),
+--- then queues entity spawns for batched delivery via tick_full_state().
+function send_full_state(conn_id)
+    ensure_msg()
+    printf("[GAMMA MP] Starting full state stream to client %d (%d entities)",
+        conn_id, _tracked_count)
+
+    -- Track as a connected client so on_host_level_load() can reach them
+    _connected_clients[conn_id] = true
+
+    -- Header: triggers CLEANING state on the client
+    mp_protocol.send_event(conn_id, MSG.FULL_STATE, {
+        entity_count = _tracked_count,
+    })
+
+    -- Snapshot _tracked_ids into a stable per-connection array.
+    -- We walk the snapshot across frames; swap-remove churn on the live
+    -- _tracked_ids array during streaming won't corrupt our cursor.
+    -- Entities that despawn before being sent are skipped via sim:object() nil check.
+    local snapshot = {}
+    for i = 1, #_tracked_ids do
+        snapshot[i] = _tracked_ids[i]
+    end
+
+    _full_state_pending[conn_id] = { ids = snapshot, cursor = 1 }
+
+    -- Send the first batch immediately — don't make the client wait a full frame
+    _tick_full_state_connection(conn_id)
+end
+
+--- Drive one frame of full-state streaming for all pending connections.
+--- Called every frame from mp_core.mp_update() while hosting.
+function tick_full_state()
+    if not next(_full_state_pending) then return end  -- fast path: nothing pending
+    -- Removing _full_state_pending[conn_id] inside the loop is safe:
+    -- Lua 5.1 allows clearing the current key during pairs() traversal.
+    for conn_id in pairs(_full_state_pending) do
+        _tick_full_state_connection(conn_id)
+    end
+end
+
+--- Cancel a pending full-state stream (client disconnected mid-stream).
+function cancel_full_state(conn_id)
+    if _full_state_pending[conn_id] then
+        _full_state_pending[conn_id] = nil
+        printf("[GAMMA MP] Full state stream cancelled for client %d", conn_id)
+    end
+    _connected_clients[conn_id] = nil
+end
+
+-- ============================================================================
+-- Client Player State (received from clients)
+-- ============================================================================
+
+function on_client_player_pos(conn_id, data)
+    _clients[conn_id] = _clients[conn_id] or {}
+    _clients[conn_id].position = data
+    -- TODO: Phase 2 - broadcast to other clients, render remote player actor
+end
+
+function on_client_player_equip(conn_id, data)
+    _clients[conn_id] = _clients[conn_id] or {}
+    _clients[conn_id].equipment = data
+end
+
+function on_client_player_stats(conn_id, data)
+    _clients[conn_id] = _clients[conn_id] or {}
+    _clients[conn_id].stats = data
+end
+
+function get_tracked_count()
+    return _tracked_count
+end
