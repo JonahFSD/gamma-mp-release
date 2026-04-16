@@ -47,7 +47,7 @@ if (Test-Path $avxExe) {
 
 # --- Copy patched engine into AVX slot ---
 Write-Host "Installing patched engine..."
-Copy-Item (Join-Path $scriptDir "bin\AnomalyDX11.exe") $avxExe -Force
+Copy-Item (Join-Path $scriptDir "bin\AnomalyDX11AVX.exe") $avxExe -Force
 
 # --- Copy DLLs ---
 Write-Host "Installing networking DLLs..."

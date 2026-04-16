@@ -49,10 +49,12 @@ foreach ($s in $scripts) {
 # --- 2. Sync mod patches ---
 Write-Host "Syncing mod patches..." -ForegroundColor Yellow
 $patchSource = Join-Path $sourceRepo "mod-patches"
+$patchDir = Join-Path $releaseDir "patches"
+New-Item -ItemType Directory -Path $patchDir -Force | Out-Null
 if (Test-Path $patchSource) {
     $patches = Get-ChildItem $patchSource -Filter "*.script"
     foreach ($p in $patches) {
-        Copy-Item $p.FullName (Join-Path $scriptsDir $p.Name) -Force
+        Copy-Item $p.FullName (Join-Path $patchDir $p.Name) -Force
         Write-Host "  [OK] $($p.Name) (mod patch)" -ForegroundColor Green
     }
 } else {
@@ -73,7 +75,7 @@ if (Test-Path $uiSource) {
     Copy-Item $uiSource (Join-Path $uiDir "ui_mp_menu.xml") -Force
     Write-Host "  [OK] ui_mp_menu.xml" -ForegroundColor Green
 } else {
-    Write-Host "  [WARN] ui_mp_menu.xml not found — check source path" -ForegroundColor Yellow
+    Write-Host "  [WARN] ui_mp_menu.xml not found - check source path" -ForegroundColor Yellow
 }
 
 # --- 4. Sync engine binaries from ANOMALY build ---
@@ -148,6 +150,15 @@ Get-ChildItem $scriptsDir | ForEach-Object {
     $size = [math]::Round($_.Length / 1KB, 1)
     Write-Host "    $($_.Name) ($size KB)" -ForegroundColor DarkGray
     $totalFiles++
+}
+
+Write-Host "  patches/" -ForegroundColor White
+if (Test-Path $patchDir) {
+    Get-ChildItem $patchDir | ForEach-Object {
+        $size = [math]::Round($_.Length / 1KB, 1)
+        Write-Host "    $($_.Name) ($size KB)" -ForegroundColor DarkGray
+        $totalFiles++
+    }
 }
 
 Write-Host "  ui/" -ForegroundColor White
