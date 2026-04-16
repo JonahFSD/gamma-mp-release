@@ -1,6 +1,6 @@
 # GAMMA Multiplayer
 
-Co-op multiplayer for S.T.A.L.K.E.R. Anomaly GAMMA. Two players in the same Zone — the host runs the game normally, and the client sees the host's world (NPCs, mutants, squads, weather, time) in real time.
+Co-op multiplayer for S.T.A.L.K.E.R. Anomaly GAMMA. Two players in the same Zone — the host runs the game normally, and the client sees the host's world (NPCs, mutants, squads, weather, time) in real time. You can see each other as characters in the world, moving, crouching, and running in sync.
 
 ---
 
@@ -69,7 +69,9 @@ The installer will:
 - Ask where Anomaly is installed (just press Enter if it's `C:\ANOMALY`)
 - Ask where GAMMA is installed (just press Enter if it's `C:\GAMMA`)
 - Back up your stock engine exe (so you can revert later)
-- Copy the multiplayer engine + scripts into the right folders
+- Copy the multiplayer engine, networking DLLs, scripts, and UI into the right folders
+- Install mod compatibility patches (e.g. surge guard fixes) into your GAMMA overwrite
+- Re-bind the unjam mod's reload key from F10 to Right Shift (F10 is now the MP menu)
 - Print OK/FAIL for every file so you know it worked
 
 ### Step 5: Play
@@ -79,7 +81,7 @@ The installer will:
 3. Press **F10** to open the Multiplayer menu.
 4. Type the **host's IP address** in the IP field.
 5. Click **Connect**.
-6. You should see "Connecting..." then "Connected" on screen. The host's world will start streaming in.
+6. You should see "Connecting..." then "Connected" on screen. The host's world will start streaming in — existing NPCs and mutants get cleaned and replaced with the host's A-Life state. After a few seconds of sync, you'll see each other as characters in the world.
 
 That's it. You're in the Zone together.
 
@@ -111,7 +113,32 @@ New-NetFirewallRule -DisplayName "GAMMA Multiplayer TCP" -Direction Inbound -Pro
 
 ## Uninstalling
 
-Right-click **`uninstall.ps1`** → **"Run with PowerShell"**. This restores your original engine and removes all multiplayer files. Your saves, mods, and GAMMA install are untouched.
+Right-click **`uninstall.ps1`** → **"Run with PowerShell"**. This restores your original engine, removes all multiplayer scripts and DLLs, removes mod patches, and reverts the unjam keybind back to F10. Your saves, mods, and GAMMA install are untouched.
+
+---
+
+## How It Works
+
+The host IS the singleplayer game running normally. A custom-patched engine and Lua sync layer watch everything the game does — NPC spawns, deaths, movement, squads, weather, time — and broadcast it over Valve's GameNetworkingSockets library to connected clients.
+
+The client suppresses its own A-Life simulation and replays the host's event stream into its local world. Entity positions update at 20Hz. Player positions update every frame. Each remote player appears as a visible NPC in your world that mirrors their position, heading, stance (crouching/standing), and movement (walking/running/idle) in real time.
+
+The installer replaces the DX11-AVX engine exe slot with a patched build that has networking support baked in, so GAMMA's Mod Organizer 2 launches it without any extra config.
+
+---
+
+## What's in This Repo
+
+| Folder/File | What it does |
+|---|---|
+| `bin/` | Patched AnomalyDX11AVX.exe + 5 networking DLLs (GameNetworkingSockets, gns_bridge, etc.) |
+| `scripts/` | 7 Lua .script files — the sync layer (protocol, host events, client state, alife guard, puppet system, UI, core orchestrator) |
+| `patches/` | Mod compatibility patches (e.g. surge guard fix to protect player puppets from emission kills) |
+| `ui/` | MP menu XML layout (the F10 menu) |
+| `install.ps1` | Installer — copies everything to the right places, backs up your stock exe |
+| `uninstall.ps1` | Uninstaller — reverts everything cleanly |
+| `build_release.ps1` | Dev only — syncs files from the source repo into this release repo |
+| `VERSION` | Current multiplayer version stamp (used for version handshake) |
 
 ---
 
@@ -132,3 +159,15 @@ Right-click **`uninstall.ps1`** → **"Run with PowerShell"**. This restores you
 
 **"gns is nil" error in console**
 → The networking DLLs didn't copy correctly. Re-run `install.ps1`.
+
+**My unjam reload key changed**
+→ The installer moves the unjam mod's reload keybind from F10 to Right Shift so it doesn't conflict with the MP menu. If you uninstall, it gets reverted back to F10.
+
+**World looks empty after connecting**
+→ Normal. When you connect, the client wipes its local A-Life and rebuilds from the host's state. This takes a few seconds — you'll see entities populating as the sync streams in.
+
+**Can I save while connected as a client?**
+→ No. Client saves are blocked while connected to prevent corrupted save files. Disconnect first, then save. The host can save normally.
+
+**Other player looks like a soldier / wrong outfit**
+→ Visual equipment sync is not yet implemented. The other player appears as a default military stalker for now. Position, stance, and movement are synced.
