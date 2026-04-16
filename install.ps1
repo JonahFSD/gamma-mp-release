@@ -60,9 +60,22 @@ foreach ($dll in $dlls) {
 Write-Host "Installing scripts..."
 $scriptsDir = Join-Path $gammaPath "overwrite\gamedata\scripts"
 New-Item -ItemType Directory -Path $scriptsDir -Force | Out-Null
-$scripts = @("mp_core.script", "mp_protocol.script", "mp_host_events.script", "mp_client_state.script", "mp_alife_guard.script", "mp_ui.script")
+$scripts = @("mp_core.script", "mp_protocol.script", "mp_host_events.script", "mp_client_state.script", "mp_alife_guard.script", "mp_puppet.script", "mp_ui.script")
 foreach ($s in $scripts) {
     Copy-Item (Join-Path $scriptDir "scripts\$s") (Join-Path $scriptsDir $s) -Force
+}
+
+# --- Copy mod patches (surge guards, etc.) ---
+Write-Host "Installing mod patches..."
+$patchDir = Join-Path $scriptDir "patches"
+if (Test-Path $patchDir) {
+    $patchFiles = Get-ChildItem $patchDir -Filter "*.script"
+    foreach ($p in $patchFiles) {
+        Copy-Item $p.FullName (Join-Path $scriptsDir $p.Name) -Force
+        Write-Host "  [OK] $($p.Name) (mod patch)" -ForegroundColor Green
+    }
+} else {
+    Write-Host "  No patches directory, skipping." -ForegroundColor Yellow
 }
 
 # --- Copy UI XML ---
@@ -110,6 +123,15 @@ foreach ($s in $scripts) {
     $target = Join-Path $scriptsDir $s
     if (Test-Path $target) { Write-Host "  OK  $target" -ForegroundColor Green }
     else { Write-Host "  FAIL  $target" -ForegroundColor Red; $allOk = $false }
+}
+
+# Patches
+if (Test-Path $patchDir) {
+    foreach ($p in $patchFiles) {
+        $target = Join-Path $scriptsDir $p.Name
+        if (Test-Path $target) { Write-Host "  OK  $target" -ForegroundColor Green }
+        else { Write-Host "  FAIL  $target" -ForegroundColor Red; $allOk = $false }
+    }
 }
 
 # UI

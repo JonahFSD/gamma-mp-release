@@ -35,10 +35,22 @@ foreach ($dll in $dlls) {
 # --- Remove scripts ---
 Write-Host "Removing MP scripts..."
 $scriptsDir = Join-Path $gammaPath "overwrite\gamedata\scripts"
-$scripts = @("mp_core.script", "mp_protocol.script", "mp_host_events.script", "mp_client_state.script", "mp_alife_guard.script", "mp_ui.script")
+$scripts = @("mp_core.script", "mp_protocol.script", "mp_host_events.script", "mp_client_state.script", "mp_alife_guard.script", "mp_puppet.script", "mp_ui.script")
 foreach ($s in $scripts) {
     $target = Join-Path $scriptsDir $s
     if (Test-Path $target) { Remove-Item $target }
+}
+
+# --- Remove mod patches ---
+Write-Host "Removing mod patches..."
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
+$patchDir = Join-Path $scriptDir "patches"
+if (Test-Path $patchDir) {
+    $patchFiles = Get-ChildItem $patchDir -Filter "*.script"
+    foreach ($p in $patchFiles) {
+        $target = Join-Path $scriptsDir $p.Name
+        if (Test-Path $target) { Remove-Item $target }
+    }
 }
 
 # --- Remove UI XML ---
